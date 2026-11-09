@@ -44,3 +44,8 @@ heartbeat 提交，用来把 schedule 一直续上去。
 - `dsh-web.service` —— 无头 DSH（`dsh web --port 3080`，WorkBuddy shim 宿主）
 
 注意：unit 名不能以 `instabox-` 开头去自定义，平台把这批名字管着，会直接判成 masked。
+
+`dsh-web-setup.sh` 就是安装 `dsh-web.service` 的脚本（在沙箱里 `bash dsh-web-setup.sh` 即可复现）。
+它把 DSH 的 stdout 落到 `/data/home/site/dsh-web.log`，站点侧 `/dsh/` 会从这份日志里
+读当前访问 token 做自动登录 —— 所以 DSH 每次重启后 token 变了也不用管，
+直接打开 `https://<域名>/dsh/?k=<页面口令>` 就能进。
