@@ -1,0 +1,92 @@
+name: InstaBox keepalive
+
+# 免费档限制（实测）：空闲 30 分钟自动暂停；单次运行上限 maxRunMinutes=120，到点强制停机，
+# 且这两项在免费档都改不了（permission_denied / spec_not_allowed）。
+# 所以「保活」不能只 ping，必须每轮检查状态、停了就重新拉起，再等站点起来。
+#
+# 需要的仓库 secrets：
+#   INSTABOX_API_KEY  ibk_...        （scope: machines:read machines:write）
+#   INSTABOX_BOX      机器 ID 或名字  （如 m_agqxbsiqvgwynvjjh2k5auu4au）
+#   INSTABOX_URL      公网地址，不带末尾斜杠
+#
+# 仓库必须是 public：private 仓库 Actions 免费额度 2000 分钟/月，
+# 10 分钟一轮（约 4300 轮/月，每轮至少计 1 分钟）会超额。
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 主保活
+    - cron: '0 3 1 * *'      # 每月 1 号顺手提交一次，避免 60 天无提交导致 schedule 被停用
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: instabox-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install instabox CLI
+        run: |
+          curl -fsSL https://api.instabox.sh/install.sh | sh
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          command -v instabox && instabox --version
+
+      - name: Ensure sandbox is running
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          BOX: ${{ secrets.INSTABOX_BOX }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INSTABOX_API_KEY:-}" ] || [ -z "${BOX:-}" ]; then
+            echo "::error::Missing secret INSTABOX_API_KEY or INSTABOX_BOX"; exit 1
+          fi
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          state=$(instabox get "$BOX" --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')
+          echo "current state: $state"
+          case "$state" in
+            running|starting)
+              echo "already up, nothing to start" ;;
+            suspended|paused|suspending|pausing)
+              echo "resuming..."; instabox resume "$BOX" ;;
+            *)
+              echo "starting..."; instabox start "$BOX" ;;
+          esac
+          instabox get "$BOX" --json | python3 -c 'import sys,json;d=json.load(sys.stdin);print("after:",d["state"],"runStartedAt:",d.get("runStartedAt"))'
+
+      - name: Wait for the site to answer
+        env:
+          INSTABOX_URL: ${{ secrets.INSTABOX_URL }}
+        run: |
+          set -uo pipefail
+          if [ -z "${INSTABOX_URL:-}" ]; then
+            echo "::error::Missing secret INSTABOX_URL"; exit 1
+          fi
+          url="${INSTABOX_URL%/}"
+          for i in $(seq 1 45); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url/healthz" || true)
+            echo "attempt $i -> $code"
+            if [ "$code" = "200" ]; then
+              echo "site is up"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::site did not come up within ~7 minutes"; exit 1
+
+      - name: Monthly activity commit (keeps the schedule enabled)
+        if: github.event.schedule == '0 3 1 * *'
+        run: |
+          set -euo pipefail
+          d=$(date -u +%Y-%m-%d)
+          git clone --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
+          cd repo
+          mkdir -p .keepalive
+          echo "$d ok" >> .keepalive/heartbeat.txt
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -am "chore: keepalive heartbeat $d" || echo "nothing to commit"
+          git push
